@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32 Case Viewer</title>
+<style>
+  :root { --bg: #e4e7e5; --panel: #f7f8f7; --fg: #1d2421; --muted: #5d6963; --line: #d0d6d2; --accent: #d2601a; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #111513; --panel: #1a1f1d; --fg: #e3e9e5; --muted: #93a19a; --line: #2e3733; --accent: #ef7a35; color-scheme: dark; }
+  }
+  html, body { height: 100%; margin: 0; }
+  body { display: flex; background: var(--bg); color: var(--fg); font: 14px system-ui, sans-serif; }
+  #stage { flex: 1; position: relative; min-width: 0; }
+  #stage canvas { display: block; width: 100%; height: 100%; }
+  #msg { position: absolute; inset: 0; display: grid; place-items: center; text-align: center; color: var(--muted); pointer-events: none; padding: 20px; line-height: 1.6; }
+  #msg[hidden] { display: none; }
+  aside { width: 230px; background: var(--panel); border-left: 1px solid var(--line); padding: 18px; display: flex; flex-direction: column; gap: 18px; overflow-y: auto; }
+  h1 { font-size: 16px; margin: 0; }
+  h2 { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin: 0 0 8px; }
+  .seg { display: flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  .seg button { flex: 1; border: 0; background: none; color: inherit; padding: 7px 0; cursor: pointer; font: inherit; }
+  .seg button + button { border-left: 1px solid var(--line); }
+  .seg button.on { background: var(--accent); color: #fff; }
+  label { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; cursor: pointer; }
+  input { accent-color: var(--accent); }
+  input[type=range] { width: 100%; }
+  small { color: var(--muted); line-height: 1.5; }
+  @media (max-width: 640px) { body { flex-direction: column; } #stage { min-height: 60vh; } aside { width: auto; border-left: 0; border-top: 1px solid var(--line); } }
+</style>
+</head>
+<body>
+<div id="stage"><div id="msg">Loading stl/…</div></div>
+<aside>
+  <h1>ESP32 case</h1>
+  <div>
+    <h2>View</h2>
+    <div class="seg">
+      <button data-mode="closed">Closed</button>
+      <button data-mode="exploded" class="on">Exploded</button>
+      <button data-mode="print">Print</button>
+    </div>
+  </div>
+  <div>
+    <h2>Show</h2>
+    <label><input type="checkbox" id="base" checked> Base</label>
+    <label><input type="checkbox" id="lid" checked> Lid</label>
+    <label><input type="checkbox" id="board" checked> Board (approx.)</label>
+    <label><input type="checkbox" id="xray"> See-through lid</label>
+  </div>
+  <div>
+    <h2>Section cut</h2>
+    <input type="range" id="cut" min="0" max="100" value="100">
+    <small id="cutv">off</small>
+  </div>
+  <small>Drag to orbit, right-drag to pan, scroll to zoom. You can also drop .stl files here.</small>
+</aside>
+
+<script src="lib/three.min.js"></script>
+<script src="lib/STLLoader.js"></script>
+<script src="lib/OrbitControls.js"></script>
+<script>
+// Case constants, keep in sync with esp32_case.scad
+const OUT_L = 61.2, OUT_W = 34.2, Z_RIM = 19.6, LID_T = 2;
+const PCB = { x: 2.6, y: 2.6, z: 12, l: 55, w: 29, t: 1.6 };
+
+const stage = document.getElementById('stage'), msg = document.getElementById('msg');
+const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setClearColor(dark ? 0x111513 : 0xe4e7e5);
+renderer.localClippingEnabled = true;
+stage.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(35, 1, 1, 2000);
+camera.up.set(0, 0, 1);
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x445046, 0.75));
+const sun = new THREE.DirectionalLight(0xffffff, 0.75); sun.position.set(60, -80, 120); scene.add(sun);
+const fill = new THREE.DirectionalLight(0xffffff, 0.3); fill.position.set(-80, 60, 40); scene.add(fill);
+const grid = new THREE.GridHelper(200, 40, dark ? 0x2a332f : 0xbfc7c2, dark ? 0x2a332f : 0xbfc7c2);
+grid.rotation.x = Math.PI / 2; grid.position.set(OUT_L / 2, OUT_W / 2, -0.05); scene.add(grid);
+
+const clip = new THREE.Plane(new THREE.Vector3(0, -1, 0), 1e4);
+const mat = (color, o = {}) => new THREE.MeshStandardMaterial({ color, roughness: 0.6, metalness: 0.05, side: THREE.DoubleSide, clippingPlanes: [clip], ...o });
+const mBase = mat(0x3f7f73), mLid = mat(0xd2601a), mPcb = mat(0x1f5f3a), mMetal = mat(0xb9bec2, { metalness: 0.6, roughness: 0.35 }), mBlack = mat(0x222222);
+
+// Rough board stand-in
+const board = new THREE.Group(); scene.add(board);
+const box = (l, w, h, x, y, z, m) => { const b = new THREE.Mesh(new THREE.BoxGeometry(l, w, h), m); b.position.set(x + l / 2, y + w / 2, z + h / 2); board.add(b); };
+const pcbTop = PCB.z + PCB.t;
+box(PCB.l, PCB.w, PCB.t, PCB.x, PCB.y, PCB.z, mPcb);
+box(25, 18, 3.2, PCB.x - 0.5, PCB.y + 5.5, pcbTop, mMetal);   // WROOM module
+box(8, 9, 3.2, PCB.x + 48, PCB.y + 10, pcbTop, mMetal);       // USB-C
+box(4, 3, 1.6, PCB.x + 49, PCB.y + 21.5, pcbTop, mBlack);     // BOOT
+box(4, 3, 1.6, PCB.x + 49, PCB.y + 4.5, pcbTop, mBlack);      // EN
+for (const y of [1.3, 27.7]) for (let i = 0; i < 15; i++) {
+  const x = PCB.x + 5.6 + i * 2.54;
+  box(2.5, 2.5, 2.5, x - 1.25, PCB.y + y - 1.25, PCB.z - 2.5, mBlack);
+  box(0.64, 0.64, 6, x - 0.32, PCB.y + y - 0.32, PCB.z - 8.5, mMetal);
+}
+
+// Parts
+const parts = { base: null, lid: null };
+const loader = new THREE.STLLoader();
+function setPart(name, geom) {
+  if (parts[name]) scene.remove(parts[name]);
+  geom.computeVertexNormals();
+  parts[name] = new THREE.Mesh(geom, name === 'lid' ? mLid : mBase);
+  parts[name].visible = document.getElementById(name).checked;
+  scene.add(parts[name]);
+  msg.hidden = true;
+  applyMode(true);
+}
+for (const name of ['base', 'lid'])
+  loader.load(`stl/esp32_case_${name}.stl`, g => setPart(name, g), undefined, () => {
+    msg.innerHTML = 'Could not load <code>stl/*.stl</code>.<br>Run <code>./view.sh</code> (browsers block file:// loads),<br>or drop the two .stl files here.';
+  });
+
+// Drag & drop fallback: name containing "lid" goes to the lid
+stage.addEventListener('dragover', e => e.preventDefault());
+stage.addEventListener('drop', e => {
+  e.preventDefault();
+  for (const f of e.dataTransfer.files)
+    f.arrayBuffer().then(buf => setPart(/lid/i.test(f.name) ? 'lid' : 'base', loader.parse(buf)));
+});
+
+// View modes. The lid STL is in print orientation (flipped), so it is turned back over to sit on the base.
+let mode = 'exploded';
+const goal = { pos: new THREE.Vector3(), rot: 0, boardZ: 0 };
+function applyMode(snap) {
+  if (mode === 'print') Object.assign(goal, { pos: new THREE.Vector3(0, OUT_W + 12, 0), rot: 0, boardZ: 0 });
+  else Object.assign(goal, { pos: new THREE.Vector3(0, OUT_W, Z_RIM + LID_T + (mode === 'exploded' ? 22 : 0)), rot: Math.PI, boardZ: mode === 'exploded' ? 8 : 0 });
+  board.visible = document.getElementById('board').checked && mode !== 'print';
+  if (snap && parts.lid) { parts.lid.position.copy(goal.pos); parts.lid.rotation.x = goal.rot; board.position.z = goal.boardZ; }
+}
+function frame() {
+  const c = new THREE.Vector3(OUT_L / 2, mode === 'print' ? OUT_W + 6 : OUT_W / 2, mode === 'exploded' ? 18 : 8);
+  controls.target.copy(c);
+  camera.position.set(c.x + 85, c.y - 120, c.z + 95);
+}
+document.querySelectorAll('.seg button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('.seg button').forEach(x => x.classList.toggle('on', x === b));
+  mode = b.dataset.mode; applyMode(); frame();
+});
+
+for (const n of ['base', 'lid']) document.getElementById(n).onchange = e => parts[n] && (parts[n].visible = e.target.checked);
+document.getElementById('board').onchange = () => applyMode();
+document.getElementById('xray').onchange = e => { mLid.transparent = e.target.checked; mLid.opacity = e.target.checked ? 0.3 : 1; mLid.depthWrite = !e.target.checked; mLid.needsUpdate = true; };
+document.getElementById('cut').oninput = e => {
+  const t = e.target.value / 100;
+  clip.constant = t >= 1 ? 1e4 : t * OUT_W;
+  document.getElementById('cutv').textContent = t >= 1 ? 'off' : `y = ${(t * OUT_W).toFixed(1)} mm`;
+};
+
+function resize() { renderer.setSize(stage.clientWidth, stage.clientHeight, false); camera.aspect = stage.clientWidth / stage.clientHeight; camera.updateProjectionMatrix(); }
+new ResizeObserver(resize).observe(stage);
+applyMode(true); frame(); resize();
+
+(function tick() {
+  if (parts.lid) {
+    parts.lid.position.lerp(goal.pos, 0.15);
+    parts.lid.rotation.x += (goal.rot - parts.lid.rotation.x) * 0.15;
+  }
+  board.position.z += (goal.boardZ - board.position.z) * 0.15;
+  controls.update();
+  renderer.render(scene, camera);
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
